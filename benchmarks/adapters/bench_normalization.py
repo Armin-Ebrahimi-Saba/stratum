@@ -75,8 +75,15 @@ def warmup(fn, n: int = 3):
 def bench_normalize(data: np.ndarray, n_reps: int) -> dict:
     results = {}
 
+    inplace_fns = {
+        "l2": rb.normalize_l2_inplace,
+        "l1": rb.normalize_l1_inplace,
+        "max": rb.normalize_max_inplace,
+    }
+
     for norm in ("l2", "l1", "max"):
-        rust_fn = {"l2": rb.normalize_l2, "l1": rb.normalize_l1, "max": rb.normalize_max}[norm]
+        rust_fn      = {"l2": rb.normalize_l2, "l1": rb.normalize_l1, "max": rb.normalize_max}[norm]
+        rust_inplace = inplace_fns[norm]
 
         warmup(lambda: normalize(data, norm=norm, copy=True))
         sklearn_t = timeit(lambda: normalize(data, norm=norm, copy=True), n_reps)
@@ -85,6 +92,13 @@ def bench_normalize(data: np.ndarray, n_reps: int) -> dict:
         rust_t = timeit(lambda: rust_fn(data), n_reps)
 
         results[f"normalize_{norm}"] = (sklearn_t, rust_t)
+
+        # In-place: L2/L1/max are idempotent on already-normalized data,
+        # so we normalize once then time repeated inplace calls on the same array.
+        normed = rust_fn(data)
+        warmup(lambda: rust_inplace(normed))
+        inplace_t = timeit(lambda: rust_inplace(normed), n_reps)
+        results[f"normalize_{norm}_inplace"] = (sklearn_t, inplace_t)
 
     return results
 

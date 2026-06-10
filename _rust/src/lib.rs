@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use ndarray::{Array2, Axis};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use ndarray::{Array1, Array2, Axis};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyList, PyModule};
 use pyo3::{PyErr, exceptions::PyValueError};
@@ -21,6 +21,7 @@ mod threads;
 mod one_hot_encoder;
 mod simd;
 mod normalize;
+mod elastic_net;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
@@ -54,11 +55,15 @@ struct FdEmbedModel {
 static FD_EMBED_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static FD_EMBED_MODELS: Lazy<Mutex<HashMap<u64, FdEmbedModel>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+
 static MIN_MAX_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static MIN_MAX_MODELS: Lazy<Mutex<HashMap<u64, normalize::MinMaxModel>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 static STD_SCALER_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static STD_SCALER_MODELS: Lazy<Mutex<HashMap<u64, normalize::StandardScalerModel>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+static EN_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static EN_MODELS: Lazy<Mutex<HashMap<u64, elastic_net::ElasticNetModel>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Simple mapping from domain error to PyErr
 fn to_pyerr(err: tfidf::Error) -> PyErr {
@@ -685,6 +690,51 @@ fn normalize_max_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<
     Ok(Py::from(arr.into_pyarray(py).to_owned()))
 }
 
+// ---- In-place variants (no allocation; caller's array is modified) ----
+
+fn inplace_par<F>(data: &mut PyReadwriteArray2<f32>, f: F) -> PyResult<()>
+where
+    F: Fn(&mut [f32]) + Sync + Send,
+{
+    let view = data.as_array();
+    if !view.is_standard_layout() {
+        return Err(PyValueError::new_err("normalize inplace requires a C-contiguous array"));
+    }
+    let n_cols = view.ncols();
+    let len    = view.len();
+    drop(view);
+    // SAFETY: PyReadwriteArray2 guarantees exclusive access. Rayon threads perform
+    // pure arithmetic on the buffer; they make no Python API calls, so holding the
+    // GIL during this call is safe (same pattern as numpy/BLAS parallel kernels).
+    let slice = unsafe { std::slice::from_raw_parts_mut(data.as_array_mut().as_mut_ptr(), len) };
+    slice.par_chunks_mut(n_cols).for_each(f);
+    Ok(())
+}
+
+#[pyfunction]
+fn normalize_l2_inplace_dense(_py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
+    inplace_par(&mut data, |row| {
+        let norm_sq = simd::norm_sq_row(row);
+        if norm_sq > 0.0 { simd::scale_row(row, 1.0 / norm_sq.sqrt()); }
+    })
+}
+
+#[pyfunction]
+fn normalize_l1_inplace_dense(_py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
+    inplace_par(&mut data, |row| {
+        let norm = simd::sum_abs_row(row);
+        if norm > 0.0 { simd::scale_row(row, 1.0 / norm); }
+    })
+}
+
+#[pyfunction]
+fn normalize_max_inplace_dense(_py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
+    inplace_par(&mut data, |row| {
+        let max_abs = simd::max_abs_row(row);
+        if max_abs > 0.0 { simd::scale_row(row, 1.0 / max_abs); }
+    })
+}
+
 #[pyfunction]
 fn min_max_fit_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<(u64, Py<PyArray2<f32>>)> {
     let arr = data.as_array().to_owned();
@@ -749,6 +799,65 @@ fn standard_scaler_transform_dense(
     Ok(Py::from(out.into_pyarray(py).to_owned()))
 }
 
+// ---- ElasticNet ----
+
+#[pyfunction]
+fn elastic_net_fit_dense(
+    py:            Python<'_>,
+    x:             PyReadonlyArray2<f32>,
+    y:             PyReadonlyArray1<f32>,
+    alpha:         f32,
+    l1_ratio:      f32,
+    max_iter:      usize,
+    tol:           f32,
+    fit_intercept: bool,
+) -> PyResult<(u64, Py<PyArray1<f32>>, f32, usize)> {
+    let x_arr = x.as_array().to_owned();
+    let y_arr = y.as_array().to_owned();
+    let model = py.allow_threads(|| {
+        elastic_net::elastic_net_fit(&x_arr, &y_arr, alpha, l1_ratio, max_iter, tol, fit_intercept)
+    });
+    let coef_arr  = Array1::from_vec(model.coef.clone());
+    let intercept = model.intercept;
+    let n_iter    = model.n_iter;
+    let model_id  = EN_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    EN_MODELS
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("EN_MODELS mutex poisoned"))?
+        .insert(model_id, model);
+    Ok((model_id, Py::from(coef_arr.into_pyarray(py).to_owned()), intercept, n_iter))
+}
+
+#[pyfunction]
+fn elastic_net_predict_dense(
+    py:       Python<'_>,
+    model_id: u64,
+    x:        PyReadonlyArray2<f32>,
+) -> PyResult<Py<PyArray1<f32>>> {
+    let x_arr = x.as_array().to_owned();
+    // Clone what we need before releasing the lock so the GIL can be dropped
+    // during prediction without holding the registry mutex.
+    let (coef, intercept, n_cols) = {
+        let guard = EN_MODELS
+            .lock()
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("EN_MODELS mutex poisoned"))?;
+        let m = guard
+            .get(&model_id)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("Unknown model_id {model_id}")))?;
+        (m.coef.clone(), m.intercept, m.n_cols)
+    };
+    let preds = py.allow_threads(|| {
+        elastic_net::elastic_net_predict(&x_arr, &elastic_net::ElasticNetModel {
+            n_cols,
+            coef,
+            intercept,
+            n_iter: 0,
+        })
+    }).map_err(|e| PyErr::new::<PyValueError, _>(e))?;
+    let preds_arr = Array1::from_vec(preds);
+    Ok(Py::from(preds_arr.into_pyarray(py).to_owned()))
+}
+
 // ---- Expose module ----
 #[pymodule]
 fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
@@ -765,9 +874,14 @@ fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(normalize_l2_dense, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_l1_dense, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_max_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_l2_inplace_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_l1_inplace_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_max_inplace_dense, m)?)?;
     m.add_function(wrap_pyfunction!(min_max_fit_dense, m)?)?;
     m.add_function(wrap_pyfunction!(min_max_transform_dense, m)?)?;
     m.add_function(wrap_pyfunction!(standard_scaler_fit_dense, m)?)?;
     m.add_function(wrap_pyfunction!(standard_scaler_transform_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(elastic_net_fit_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(elastic_net_predict_dense, m)?)?;
     Ok(())
 }
