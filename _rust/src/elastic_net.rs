@@ -16,23 +16,24 @@
 //!     3. w_new_j = soft_threshold(rho_j, α·ρ) / (||X[:,j]||²/n + α·(1−ρ))
 //!     4. r[i]   -= Σ_j X[i,j] · (w_new_j − w_j)      (one parallel row pass)
 //!
-//! Parallelism strategy (no SIMD)
-//! --------------------------------
-//! Both Steps 1 and 4 are structured as row-wise operations over the
-//! C-contiguous X buffer, so each thread works on a contiguous row-chunk:
+//! Parallelism + SIMD strategy
+//! ----------------------------
+//! Both Steps 1 and 4 are row-wise sweeps over the C-contiguous X buffer.
+//! Each Rayon thread owns a contiguous row-chunk; SIMD kernels (simd::dot,
+//! simd::axpy, simd::sq_acc) vectorize the per-row inner loops.
 //!
-//!   Step 1  par_chunks(n_cols) + fold/reduce — accumulates X[:,j]ᵀ·r
-//!           for all columns j simultaneously.  ONE Rayon synchronisation
-//!           point (vs 2·n_cols with per-coordinate par_iter calls).
+//!   Step 1  par_chunks + fold/reduce with simd::axpy — each thread
+//!           accumulates acc[j] += r[i]·X[i,j] using FMA.  ONE Rayon sync.
 //!
-//!   Step 4  par_chunks(n_cols) + par_iter_mut — each thread applies the
-//!           coefficient deltas to its row-chunk.  ONE Rayon sync.
+//!   Step 4  par_chunks + par_iter_mut with simd::dot — each thread
+//!           computes r[i] -= dot(X[i,:], Δw) using FMA.  ONE Rayon sync.
 //!
-//! With 2 (+ a small intercept) Rayon barriers per outer iteration the
-//! synchronisation overhead is amortised over O(n_rows·n_cols) work.
+//! With 2 Rayon barriers per outer iteration and SIMD inner loops,
+//! synchronisation overhead is amortised over O(n_rows·n_cols) FMA work.
 
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
+use crate::simd;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -84,14 +85,11 @@ pub fn elastic_net_fit(
         .par_chunks(n_cols)
         .fold(
             || vec![0.0f32; n_cols],
-            |mut acc, row| {
-                for (a, &v) in acc.iter_mut().zip(row.iter()) { *a += v * v; }
-                acc
-            },
+            |mut acc, row| { simd::sq_acc(&mut acc, row); acc },
         )
         .reduce(
             || vec![0.0f32; n_cols],
-            |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
+            |mut a, b| { simd::axpy(&mut a, 1.0, &b); a },
         )
         .into_iter()
         .map(|s| s / n)
@@ -118,14 +116,11 @@ pub fn elastic_net_fit(
             .zip(r.par_iter())
             .fold(
                 || vec![0.0f32; n_cols],
-                |mut acc, (row, &ri)| {
-                    for (a, &xij) in acc.iter_mut().zip(row.iter()) { *a += ri * xij; }
-                    acc
-                },
+                |mut acc, (row, &ri)| { simd::axpy(&mut acc, ri, row); acc },
             )
             .reduce(
                 || vec![0.0f32; n_cols],
-                |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
+                |mut a, b| { simd::axpy(&mut a, 1.0, &b); a },
             );
 
         // ── Step 2: update all coordinates (sequential, O(n_cols)) ───────────
@@ -148,11 +143,7 @@ pub fn elastic_net_fit(
             .par_chunks(n_cols)
             .zip(r.par_iter_mut())
             .for_each(|(row, ri)| {
-                let correction: f32 = row.iter()
-                    .zip(coef_deltas.iter())
-                    .map(|(&xij, &dj)| xij * dj)
-                    .sum();
-                *ri -= correction;
+                *ri -= simd::dot(row, &coef_deltas);
             });
 
         // ── Step 4: intercept update (sequential, cheap) ──────────────────────
@@ -190,10 +181,7 @@ pub fn elastic_net_predict(
     let preds = x.as_slice()
         .ok_or("elastic_net_predict: C-contiguous input required")?
         .par_chunks(model.n_cols)
-        .map(|row| {
-            row.iter().zip(coef.iter()).map(|(&xi, &ci)| xi * ci).sum::<f32>()
-                + intercept
-        })
+        .map(|row| simd::dot(row, coef) + intercept)
         .collect();
     Ok(preds)
 }
