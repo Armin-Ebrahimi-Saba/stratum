@@ -148,46 +148,58 @@ pub struct StandardScalerModel {
 
 // ---- StandardScaler stat helpers ----
 
-// Two row-wise passes using par_chunks.
-// Pass 1 accumulates per-column sums; pass 2 accumulates per-column squared deviations.
+// Single-pass parallel Welford (Chan's algorithm).
+//
+// Each fold accumulator holds (count, mean[], M2[]) where M2[j] is the sum of
+// squared deviations from the running mean for column j.  The reduce step
+// merges two accumulators using Chan's numerically-stable combination formula:
+//
+//   delta      = mean_b - mean_a
+//   mean_ab    = mean_a + delta * n_b / (n_a + n_b)
+//   M2_ab      = M2_a + M2_b + delta² * n_a * n_b / (n_a + n_b)
+//
+// At the end: population variance = M2 / n, inv_std = 1 / sqrt(variance).
 fn std_scaler_stats_rowwise(data: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
     let n_cols = data.ncols();
-    let n = data.nrows() as f32;
     let raw = data.as_slice().expect("C-contiguous");
 
-    // Pass 1: mean
-    let sum: Vec<f32> = raw
-        .par_chunks(n_cols)
-        .fold(
-            || vec![0.0f32; n_cols],
-            |mut acc, row| { for (j, &v) in row.iter().enumerate() { acc[j] += v; } acc },
-        )
-        .reduce(
-            || vec![0.0f32; n_cols],
-            |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
-        );
-    let mean: Vec<f32> = sum.iter().map(|&s| s / n).collect();
+    type State = (usize, Vec<f32>, Vec<f32>); // (count, mean, M2)
 
-    // Pass 2: variance
-    let sq: Vec<f32> = raw
+    let (n_total, mean, m2): State = raw
         .par_chunks(n_cols)
         .fold(
-            || vec![0.0f32; n_cols],
-            |mut acc, row| {
-                for (j, &v) in row.iter().enumerate() {
-                    let d = v - mean[j];
-                    acc[j] += d * d;
+            || (0usize, vec![0.0f32; n_cols], vec![0.0f32; n_cols]),
+            |(mut count, mut mean, mut m2), row| {
+                count += 1;
+                for j in 0..n_cols {
+                    let delta  = row[j] - mean[j];
+                    mean[j]   += delta / count as f32;
+                    m2[j]     += delta * (row[j] - mean[j]); // delta * delta2
                 }
-                acc
+                (count, mean, m2)
             },
         )
         .reduce(
-            || vec![0.0f32; n_cols],
-            |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
+            || (0usize, vec![0.0f32; n_cols], vec![0.0f32; n_cols]),
+            |(n1, mean1, m2_1), (n2, mean2, m2_2)| {
+                let n = n1 + n2;
+                if n == 0 {
+                    return (0, vec![0.0f32; n_cols], vec![0.0f32; n_cols]);
+                }
+                let (n1f, n2f, nf) = (n1 as f32, n2 as f32, n as f32);
+                let mut out_mean = vec![0.0f32; n_cols];
+                let mut out_m2   = vec![0.0f32; n_cols];
+                for j in 0..n_cols {
+                    let delta    = mean2[j] - mean1[j];
+                    out_mean[j]  = mean1[j] + delta * (n2f / nf);
+                    out_m2[j]    = m2_1[j] + m2_2[j] + delta * delta * (n1f * n2f / nf);
+                }
+                (n, out_mean, out_m2)
+            },
         );
 
-    let inv_std: Vec<f32> = sq.iter().map(|&s| {
-        let var = s / n;
+    let inv_std: Vec<f32> = m2.iter().map(|&s| {
+        let var = s / n_total as f32;
         if var > 0.0 { 1.0 / var.sqrt() } else { 0.0 }
     }).collect();
 
