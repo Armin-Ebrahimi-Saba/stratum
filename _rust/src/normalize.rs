@@ -47,30 +47,40 @@ pub struct MinMaxModel {
     pub scale: Vec<f32>, // 1 / (max - min); 0 for constant columns
 }
 
-pub fn min_max_fit(data: &Array2<f32>) -> (MinMaxModel, Array2<f32>) {
+// ---- MinMax stat helpers (two strategies for fitting column stats) ----
+
+// Single row-wise pass using par_chunks on the raw C-contiguous slice.
+// Each rayon thread accumulates its own (min, max) vecs; a final reduce merges them.
+// No extra allocation proportional to input size — accumulators are O(n_cols) each.
+fn min_max_stats_rowwise(data: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
+    let n_cols = data.ncols();
+    let raw = data.as_slice().expect("C-contiguous");
+    raw.par_chunks(n_cols)
+        .fold(
+            || (vec![f32::INFINITY; n_cols], vec![f32::NEG_INFINITY; n_cols]),
+            |(mut mn, mut mx), row| {
+                for (j, &v) in row.iter().enumerate() {
+                    if v < mn[j] { mn[j] = v; }
+                    if v > mx[j] { mx[j] = v; }
+                }
+                (mn, mx)
+            },
+        )
+        .reduce(
+            || (vec![f32::INFINITY; n_cols], vec![f32::NEG_INFINITY; n_cols]),
+            |(mut mn1, mut mx1), (mn2, mx2)| {
+                for j in 0..n_cols {
+                    mn1[j] = mn1[j].min(mn2[j]);
+                    mx1[j] = mx1[j].max(mx2[j]);
+                }
+                (mn1, mx1)
+            },
+        )
+}
+
+fn min_max_apply(data: &Array2<f32>, min: Vec<f32>, scale: Vec<f32>) -> (MinMaxModel, Array2<f32>) {
     let n_rows = data.nrows();
     let n_cols = data.ncols();
-
-    let stats: Vec<(f32, f32)> = (0..n_cols)
-        .into_par_iter()
-        .map(|j| {
-            data.column(j)
-                .iter()
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &v| {
-                    (mn.min(v), mx.max(v))
-                })
-        })
-        .collect();
-
-    let min: Vec<f32> = stats.iter().map(|(mn, _)| *mn).collect();
-    let scale: Vec<f32> = stats
-        .iter()
-        .map(|(mn, mx)| {
-            let range = mx - mn;
-            if range > 0.0 { 1.0 / range } else { 0.0 }
-        })
-        .collect();
-
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
     out.axis_iter_mut(Axis(0))
         .into_par_iter()
@@ -80,9 +90,22 @@ pub fn min_max_fit(data: &Array2<f32>) -> (MinMaxModel, Array2<f32>) {
                 out_row[j] = (in_row[j] - min[j]) * scale[j];
             }
         });
-
     (MinMaxModel { n_cols, min, scale }, out)
 }
+
+fn stats_to_scale(min: &[f32], max: &[f32]) -> Vec<f32> {
+    min.iter().zip(max.iter()).map(|(&mn, &mx)| {
+        let range = mx - mn;
+        if range > 0.0 { 1.0 / range } else { 0.0 }
+    }).collect()
+}
+
+pub fn min_max_fit(data: &Array2<f32>) -> (MinMaxModel, Array2<f32>) {
+    let (min, max) = min_max_stats_rowwise(data);
+    let scale = stats_to_scale(&min, &max);
+    min_max_apply(data, min, scale)
+}
+
 
 pub fn min_max_transform(data: &Array2<f32>, model: &MinMaxModel) -> Result<Array2<f32>, String> {
     if data.ncols() != model.n_cols {
@@ -114,25 +137,61 @@ pub struct StandardScalerModel {
     pub inv_std: Vec<f32>, // 1 / std; 0 for zero-variance columns
 }
 
-pub fn standard_scaler_fit(data: &Array2<f32>) -> (StandardScalerModel, Array2<f32>) {
+// ---- StandardScaler stat helpers ----
+
+// Two row-wise passes using par_chunks.
+// Pass 1 accumulates per-column sums; pass 2 accumulates per-column squared deviations.
+fn std_scaler_stats_rowwise(data: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
+    let n_cols = data.ncols();
+    let n = data.nrows() as f32;
+    let raw = data.as_slice().expect("C-contiguous");
+
+    // Pass 1: mean
+    let sum: Vec<f32> = raw
+        .par_chunks(n_cols)
+        .fold(
+            || vec![0.0f32; n_cols],
+            |mut acc, row| { for (j, &v) in row.iter().enumerate() { acc[j] += v; } acc },
+        )
+        .reduce(
+            || vec![0.0f32; n_cols],
+            |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
+        );
+    let mean: Vec<f32> = sum.iter().map(|&s| s / n).collect();
+
+    // Pass 2: variance
+    let sq: Vec<f32> = raw
+        .par_chunks(n_cols)
+        .fold(
+            || vec![0.0f32; n_cols],
+            |mut acc, row| {
+                for (j, &v) in row.iter().enumerate() {
+                    let d = v - mean[j];
+                    acc[j] += d * d;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f32; n_cols],
+            |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
+        );
+
+    let inv_std: Vec<f32> = sq.iter().map(|&s| {
+        let var = s / n;
+        if var > 0.0 { 1.0 / var.sqrt() } else { 0.0 }
+    }).collect();
+
+    (mean, inv_std)
+}
+
+fn std_scaler_apply(
+    data: &Array2<f32>,
+    mean: Vec<f32>,
+    inv_std: Vec<f32>,
+) -> (StandardScalerModel, Array2<f32>) {
     let n_rows = data.nrows();
     let n_cols = data.ncols();
-    let n = n_rows as f32;
-
-    let stats: Vec<(f32, f32)> = (0..n_cols)
-        .into_par_iter()
-        .map(|j| {
-            let col = data.column(j);
-            let mean: f32 = col.iter().sum::<f32>() / n;
-            let variance: f32 = col.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
-            let inv_std = if variance > 0.0 { 1.0 / variance.sqrt() } else { 0.0 };
-            (mean, inv_std)
-        })
-        .collect();
-
-    let mean: Vec<f32> = stats.iter().map(|(m, _)| *m).collect();
-    let inv_std: Vec<f32> = stats.iter().map(|(_, s)| *s).collect();
-
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
     out.axis_iter_mut(Axis(0))
         .into_par_iter()
@@ -142,9 +201,14 @@ pub fn standard_scaler_fit(data: &Array2<f32>) -> (StandardScalerModel, Array2<f
                 out_row[j] = (in_row[j] - mean[j]) * inv_std[j];
             }
         });
-
     (StandardScalerModel { n_cols, mean, inv_std }, out)
 }
+
+pub fn standard_scaler_fit(data: &Array2<f32>) -> (StandardScalerModel, Array2<f32>) {
+    let (mean, inv_std) = std_scaler_stats_rowwise(data);
+    std_scaler_apply(data, mean, inv_std)
+}
+
 
 pub fn standard_scaler_transform(
     data: &Array2<f32>,
