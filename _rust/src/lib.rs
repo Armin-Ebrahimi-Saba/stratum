@@ -19,6 +19,7 @@ mod truncated_svd;  //TruncatedSVD using randomized SVD
 mod util;
 mod threads;
 mod one_hot_encoder;
+mod simd;
 mod normalize;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};

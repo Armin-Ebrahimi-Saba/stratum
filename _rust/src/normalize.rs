@@ -1,40 +1,49 @@
 use ndarray::{Array2, Axis};
 use rayon::prelude::*;
 
+use crate::simd;
+
 // ---- Stateless row-wise normalizations ----
+//
+// All three functions bypass ndarray's axis iterator and operate on the raw
+// C-contiguous slice directly.  par_chunks_mut partitions the flat buffer into
+// per-row slices, and simd::* dispatch to NEON (aarch64) or AVX2 (x86_64).
 
 pub fn normalize_l2(data: &mut Array2<f32>) {
-    data.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .for_each(|mut row| {
-            let norm_sq: f32 = row.iter().map(|x| x * x).sum();
+    let n_cols = data.ncols();
+    data.as_slice_mut()
+        .expect("normalize_l2: C-contiguous input required")
+        .par_chunks_mut(n_cols)
+        .for_each(|row| {
+            let norm_sq = simd::norm_sq_row(row);
             if norm_sq > 0.0 {
-                let inv = 1.0 / norm_sq.sqrt();
-                row.mapv_inplace(|x| x * inv);
+                simd::scale_row(row, 1.0 / norm_sq.sqrt());
             }
         });
 }
 
 pub fn normalize_l1(data: &mut Array2<f32>) {
-    data.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .for_each(|mut row| {
-            let norm: f32 = row.iter().map(|x| x.abs()).sum();
+    let n_cols = data.ncols();
+    data.as_slice_mut()
+        .expect("normalize_l1: C-contiguous input required")
+        .par_chunks_mut(n_cols)
+        .for_each(|row| {
+            let norm = simd::sum_abs_row(row);
             if norm > 0.0 {
-                let inv = 1.0 / norm;
-                row.mapv_inplace(|x| x * inv);
+                simd::scale_row(row, 1.0 / norm);
             }
         });
 }
 
 pub fn normalize_max(data: &mut Array2<f32>) {
-    data.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .for_each(|mut row| {
-            let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    let n_cols = data.ncols();
+    data.as_slice_mut()
+        .expect("normalize_max: C-contiguous input required")
+        .par_chunks_mut(n_cols)
+        .for_each(|row| {
+            let max_abs = simd::max_abs_row(row);
             if max_abs > 0.0 {
-                let inv = 1.0 / max_abs;
-                row.mapv_inplace(|x| x * inv);
+                simd::scale_row(row, 1.0 / max_abs);
             }
         });
 }
