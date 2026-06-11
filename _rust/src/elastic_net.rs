@@ -3,37 +3,32 @@
 //! Minimises: (1/2n)||y − Xw − b||² + α·ρ·||w||₁ + (α/2)·(1−ρ)·||w||²
 //!   where α = alpha, ρ = l1_ratio.
 //!
-//! Algorithm: Jacobi parallel coordinate descent
-//! -----------------------------------------------
-//! Unlike Gauss-Seidel CD (where each coordinate update immediately modifies
-//! the residual seen by subsequent coordinates in the same pass), we compute
-//! all coordinate updates simultaneously from the *same* residual snapshot,
-//! then apply all residual corrections in one batch.
+//! Algorithm: fused single-pass coordinate descent
+//! -------------------------------------------------
+//! The original two-pass Jacobi loop read X twice per iteration:
+//!   pass 1 — accumulate X^T·r  (fold/reduce over rows)
+//!   pass 2 — update residuals  (par_for_each over rows)
+//! For matrices larger than L3 cache (≥ 20 MB) both passes hit DRAM,
+//! making the algorithm memory-bandwidth bound.
 //!
-//!   for each outer iteration:
-//!     1. dot_j   = (1/n) · X[:,j]ᵀ · r   for all j  (one parallel fold/reduce)
-//!     2. rho_j   = dot_j + w[j] · ||X[:,j]||²/n      (scalar, O(n_cols))
-//!     3. w_new_j = soft_threshold(rho_j, α·ρ) / (||X[:,j]||²/n + α·(1−ρ))
-//!     4. r[i]   -= Σ_j X[i,j] · (w_new_j − w_j)      (one parallel row pass)
+//! The fused pass reads X once per iteration. Each Rayon task owns a block
+//! of B rows (target ~256 KB → fits in L2 cache) and performs both operations
+//! before moving on:
 //!
-//! Parallelism + SIMD strategy
-//! ----------------------------
-//! Both Steps 1 and 4 are row-wise sweeps over the C-contiguous X buffer.
-//! Each Rayon thread owns a contiguous row-chunk; SIMD kernels (simd::dot,
-//! simd::axpy, simd::sq_acc) vectorize the per-row inner loops.
+//!   for each row-block B:
+//!     phase 1 — r[B] -= X[B] · Δw_prev        (X[B] cold → loads into L2)
+//!     phase 2 — dots += X[B]^T · r[B]          (X[B] L2-hot; r[B] L1-hot)
+//!   coordinate update  (O(n_cols), sequential)
 //!
-//!   Step 1  par_chunks + fold/reduce with simd::axpy — each thread
-//!           accumulates acc[j] += r[i]·X[i,j] using FMA.  ONE Rayon sync.
-//!
-//!   Step 4  par_chunks + par_iter_mut with simd::dot — each thread
-//!           computes r[i] -= dot(X[i,:], Δw) using FMA.  ONE Rayon sync.
-//!
-//! With 2 Rayon barriers per outer iteration and SIMD inner loops,
-//! synchronisation overhead is amortised over O(n_rows·n_cols) FMA work.
+//! Δw_prev is the coefficient delta from the PREVIOUS iteration; applying it
+//! in phase 1 brings r in sync with the current coef before accumulating dots.
+//! The first iteration is correct because Δw_prev starts at zero.
+//! SIMD kernels (simd::dot / simd::axpy) vectorise both inner loops with FMA.
 
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use crate::simd;
+use crate::threads::get_thread_pool;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -80,20 +75,38 @@ pub fn elastic_net_fit(
     // Chunks of size n_cols correspond to individual rows of X.
     let x_raw = x.as_slice().expect("X must be C-contiguous");
 
+    let pool = get_thread_pool();
+
     // ── Precompute (1/n)·||X[:,j]||² for all j in one row-wise parallel pass ──
-    let col_norm_sq: Vec<f32> = x_raw
-        .par_chunks(n_cols)
-        .fold(
-            || vec![0.0f32; n_cols],
-            |mut acc, row| { simd::sq_acc(&mut acc, row); acc },
-        )
-        .reduce(
-            || vec![0.0f32; n_cols],
-            |mut a, b| { simd::axpy(&mut a, 1.0, &b); a },
-        )
-        .into_iter()
-        .map(|s| s / n)
-        .collect();
+    let col_norm_sq: Vec<f32> = {
+        let compute = || x_raw
+            .par_chunks(n_cols)
+            .fold(
+                || vec![0.0f32; n_cols],
+                |mut acc, row| { simd::sq_acc(&mut acc, row); acc },
+            )
+            .reduce(
+                || vec![0.0f32; n_cols],
+                |mut a, b| { simd::axpy(&mut a, 1.0, &b); a },
+            )
+            .into_iter()
+            .map(|s| s / n)
+            .collect();
+        match pool { Some(p) => p.install(compute), None => compute() }
+    };
+
+    // ── Precompute Σ_i X[i,j] — used to correct the intercept update for the
+    // one-iteration lag introduced by the fused pass (r reflects coef_prev,
+    // not coef_current; b_delta_exact = mean(r) − dot(col_sum, Δw) / n). ──
+    let col_sum: Vec<f32> = if fit_intercept {
+        let compute = || x_raw
+            .par_chunks(n_cols)
+            .fold(|| vec![0.0f32; n_cols], |mut acc, row| { simd::axpy(&mut acc, 1.0, row); acc })
+            .reduce(|| vec![0.0f32; n_cols], |mut a, b| { simd::axpy(&mut a, 1.0, &b); a });
+        match pool { Some(p) => p.install(compute), None => compute() }
+    } else {
+        Vec::new()
+    };
 
     // ── Initialise ────────────────────────────────────────────────────────────
     let mut coef = vec![0.0f32; n_cols];
@@ -105,57 +118,68 @@ pub fn elastic_net_fit(
     // r = y − X·w − b; with w = 0: r = y − intercept
     let mut r: Vec<f32> = y.iter().map(|&yi| yi - intercept).collect();
 
+    // block_rows: target ~256 KB of X per block to fit in L2 cache.
+    let block_rows = (256_usize * 1024 / (n_cols * 4)).clamp(64, 4096);
+
+    // Coefficient deltas from the previous iteration; applied to r at the START
+    // of each fused pass so X needs to be read only once per iteration.
+    let mut prev_deltas = vec![0.0f32; n_cols];
+
     let mut n_iter = max_iter;
 
     for iter in 0..max_iter {
-        // ── Step 1: X^T · r for all columns — one parallel fold/reduce ────────
-        // Each thread accumulates partial sums over its row-chunk.
-        // Result: dots[j] = sum_i r[i] · x[i,j]
-        let dots: Vec<f32> = x_raw
-            .par_chunks(n_cols)
-            .zip(r.par_iter())
-            .fold(
-                || vec![0.0f32; n_cols],
-                |mut acc, (row, &ri)| { simd::axpy(&mut acc, ri, row); acc },
-            )
-            .reduce(
-                || vec![0.0f32; n_cols],
-                |mut a, b| { simd::axpy(&mut a, 1.0, &b); a },
-            );
+        // ── Fused pass: ONE read of X per iteration ───────────────────────────
+        // Each Rayon task handles block_rows rows:
+        //   phase 1 — r[block] -= X[block] · prev_deltas  (X[block] cold → L2)
+        //   phase 2 — dots     += X[block]^T · r[block]   (X[block] L2-hot)
+        let dots: Vec<f32> = {
+            let mut fused = || x_raw
+                .par_chunks(block_rows * n_cols)
+                .zip(r.par_chunks_mut(block_rows))
+                .fold(
+                    || vec![0.0f32; n_cols],
+                    |mut local_dots, (x_block, r_block)| {
+                        for (row, ri) in x_block.chunks(n_cols).zip(r_block.iter_mut()) {
+                            *ri -= simd::dot(row, &prev_deltas);
+                        }
+                        for (row, &ri) in x_block.chunks(n_cols).zip(r_block.iter()) {
+                            simd::axpy(&mut local_dots, ri, row);
+                        }
+                        local_dots
+                    },
+                )
+                .reduce(|| vec![0.0f32; n_cols], |mut a, b| { simd::axpy(&mut a, 1.0, &b); a });
+            match pool { Some(p) => p.install(fused), None => fused() }
+        };
 
-        // ── Step 2: update all coordinates (sequential, O(n_cols)) ───────────
-        let mut max_delta   = 0.0f32;
-        let mut coef_deltas = vec![0.0f32; n_cols];
+        // ── Coordinate update (sequential, O(n_cols)) ─────────────────────────
+        let mut max_delta = 0.0f32;
+        prev_deltas.fill(0.0);
         for j in 0..n_cols {
             if col_norm_sq[j] == 0.0 { continue; }
             let rho_j = dots[j] / n + coef[j] * col_norm_sq[j];
             let new_w = soft_threshold(rho_j, l1_pen) / (col_norm_sq[j] + l2_pen);
             let delta = new_w - coef[j];
-            coef_deltas[j] = delta;
+            prev_deltas[j] = delta;
             coef[j]        = new_w;
             let rel = delta.abs() / new_w.abs().max(1.0);
             if rel > max_delta { max_delta = rel; }
         }
 
-        // ── Step 3: update residuals — one parallel row pass ─────────────────
-        // r[i] -= X[i,:] · delta_w   (row dot-product with coef change vector)
-        x_raw
-            .par_chunks(n_cols)
-            .zip(r.par_iter_mut())
-            .for_each(|(row, ri)| {
-                *ri -= simd::dot(row, &coef_deltas);
-            });
-
-        // ── Step 4: intercept update (sequential, cheap) ──────────────────────
+        // ── Intercept update (sequential, O(n_rows + n_cols)) ────────────────
+        // r reflects coef_prev; the lag correction dot(col_sum, prev_deltas)/n
+        // accounts for the Δw not yet applied to r, making b_delta exact.
         if fit_intercept {
-            let b_delta = r.iter().sum::<f32>() / n;
+            let lag: f32 = col_sum.iter().zip(prev_deltas.iter())
+                .map(|(&s, &d)| s * d).sum::<f32>();
+            let b_delta = r.iter().sum::<f32>() / n - lag / n;
             if b_delta.abs() > f32::EPSILON {
                 for ri in r.iter_mut() { *ri -= b_delta; }
                 intercept += b_delta;
             }
         }
 
-        // ── Convergence ──────────────────────────────────────────────────────
+        // ── Convergence ───────────────────────────────────────────────────────
         if max_delta < tol {
             n_iter = iter + 1;
             break;
@@ -178,11 +202,10 @@ pub fn elastic_net_predict(
     }
     let coef      = &model.coef;
     let intercept = model.intercept;
-    let preds = x.as_slice()
-        .ok_or("elastic_net_predict: C-contiguous input required")?
-        .par_chunks(model.n_cols)
-        .map(|row| simd::dot(row, coef) + intercept)
-        .collect();
+    let raw = x.as_slice().ok_or("elastic_net_predict: C-contiguous input required")?;
+    let pool = get_thread_pool();
+    let compute = || raw.par_chunks(model.n_cols).map(|row| simd::dot(row, coef) + intercept).collect();
+    let preds = match pool { Some(p) => p.install(compute), None => compute() };
     Ok(preds)
 }
 
