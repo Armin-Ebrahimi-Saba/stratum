@@ -1,42 +1,64 @@
 use ndarray::{Array2, Axis};
 use rayon::prelude::*;
+use crate::threads::get_thread_pool;
 
 // ---- Stateless row-wise normalizations ----
 
 pub fn normalize_l2(data: &mut Array2<f32>) {
-    data.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .for_each(|mut row| {
-            let norm_sq: f32 = row.iter().map(|x| x * x).sum();
-            if norm_sq > 0.0 {
-                let inv = 1.0 / norm_sq.sqrt();
-                row.mapv_inplace(|x| x * inv);
-            }
-        });
+    let pool = get_thread_pool();
+    let mut work = || {
+        data.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut row| {
+                let norm_sq: f32 = row.iter().map(|x| x * x).sum();
+                if norm_sq > 0.0 {
+                    let inv = 1.0 / norm_sq.sqrt();
+                    row.mapv_inplace(|x| x * inv);
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
 }
 
 pub fn normalize_l1(data: &mut Array2<f32>) {
-    data.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .for_each(|mut row| {
-            let norm: f32 = row.iter().map(|x| x.abs()).sum();
-            if norm > 0.0 {
-                let inv = 1.0 / norm;
-                row.mapv_inplace(|x| x * inv);
-            }
-        });
+    let pool = get_thread_pool();
+    let mut work = || {
+        data.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut row| {
+                let norm: f32 = row.iter().map(|x| x.abs()).sum();
+                if norm > 0.0 {
+                    let inv = 1.0 / norm;
+                    row.mapv_inplace(|x| x * inv);
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
 }
 
 pub fn normalize_max(data: &mut Array2<f32>) {
-    data.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .for_each(|mut row| {
-            let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            if max_abs > 0.0 {
-                let inv = 1.0 / max_abs;
-                row.mapv_inplace(|x| x * inv);
-            }
-        });
+    let pool = get_thread_pool();
+    let mut work = || {
+        data.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut row| {
+                let max_abs = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                if max_abs > 0.0 {
+                    let inv = 1.0 / max_abs;
+                    row.mapv_inplace(|x| x * inv);
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
 }
 
 // ---- MinMaxScaler (per-column, fits to [0, 1]) ----
@@ -55,41 +77,55 @@ pub struct MinMaxModel {
 fn min_max_stats_rowwise(data: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
     let n_cols = data.ncols();
     let raw = data.as_slice().expect("C-contiguous");
-    raw.par_chunks(n_cols)
-        .fold(
-            || (vec![f32::INFINITY; n_cols], vec![f32::NEG_INFINITY; n_cols]),
-            |(mut mn, mut mx), row| {
-                for (j, &v) in row.iter().enumerate() {
-                    if v < mn[j] { mn[j] = v; }
-                    if v > mx[j] { mx[j] = v; }
-                }
-                (mn, mx)
-            },
-        )
-        .reduce(
-            || (vec![f32::INFINITY; n_cols], vec![f32::NEG_INFINITY; n_cols]),
-            |(mut mn1, mut mx1), (mn2, mx2)| {
-                for j in 0..n_cols {
-                    mn1[j] = mn1[j].min(mn2[j]);
-                    mx1[j] = mx1[j].max(mx2[j]);
-                }
-                (mn1, mx1)
-            },
-        )
+    let pool = get_thread_pool();
+    let mut work = || {
+        raw.par_chunks(n_cols)
+            .fold(
+                || (vec![f32::INFINITY; n_cols], vec![f32::NEG_INFINITY; n_cols]),
+                |(mut mn, mut mx), row| {
+                    for (j, &v) in row.iter().enumerate() {
+                        if v < mn[j] { mn[j] = v; }
+                        if v > mx[j] { mx[j] = v; }
+                    }
+                    (mn, mx)
+                },
+            )
+            .reduce(
+                || (vec![f32::INFINITY; n_cols], vec![f32::NEG_INFINITY; n_cols]),
+                |(mut mn1, mut mx1), (mn2, mx2)| {
+                    for j in 0..n_cols {
+                        mn1[j] = mn1[j].min(mn2[j]);
+                        mx1[j] = mx1[j].max(mx2[j]);
+                    }
+                    (mn1, mx1)
+                },
+            )
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
 }
 
 fn min_max_apply(data: &Array2<f32>, min: Vec<f32>, scale: Vec<f32>) -> (MinMaxModel, Array2<f32>) {
     let n_rows = data.nrows();
     let n_cols = data.ncols();
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
-    out.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(data.axis_iter(Axis(0)))
-        .for_each(|(mut out_row, in_row)| {
-            for j in 0..n_cols {
-                out_row[j] = (in_row[j] - min[j]) * scale[j];
-            }
-        });
+    let pool = get_thread_pool();
+    let mut work = || {
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(data.axis_iter(Axis(0)))
+            .for_each(|(mut out_row, in_row)| {
+                for j in 0..n_cols {
+                    out_row[j] = (in_row[j] - min[j]) * scale[j];
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
     (MinMaxModel { n_cols, min, scale }, out)
 }
 
@@ -118,14 +154,21 @@ pub fn min_max_transform(data: &Array2<f32>, model: &MinMaxModel) -> Result<Arra
     let n_rows = data.nrows();
     let n_cols = model.n_cols;
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
-    out.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(data.axis_iter(Axis(0)))
-        .for_each(|(mut out_row, in_row)| {
-            for j in 0..n_cols {
-                out_row[j] = (in_row[j] - model.min[j]) * model.scale[j];
-            }
-        });
+    let pool = get_thread_pool();
+    let mut work = || {
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(data.axis_iter(Axis(0)))
+            .for_each(|(mut out_row, in_row)| {
+                for j in 0..n_cols {
+                    out_row[j] = (in_row[j] - model.min[j]) * model.scale[j];
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
     Ok(out)
 }
 
@@ -145,37 +188,48 @@ fn std_scaler_stats_rowwise(data: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
     let n_cols = data.ncols();
     let n = data.nrows() as f32;
     let raw = data.as_slice().expect("C-contiguous");
+    let pool = get_thread_pool();
 
     // Pass 1: mean
-    let sum: Vec<f32> = raw
-        .par_chunks(n_cols)
-        .fold(
-            || vec![0.0f32; n_cols],
-            |mut acc, row| { for (j, &v) in row.iter().enumerate() { acc[j] += v; } acc },
-        )
-        .reduce(
-            || vec![0.0f32; n_cols],
-            |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
-        );
+    let work_sum = || {
+        raw.par_chunks(n_cols)
+            .fold(
+                || vec![0.0f32; n_cols],
+                |mut acc, row| { for (j, &v) in row.iter().enumerate() { acc[j] += v; } acc },
+            )
+            .reduce(
+                || vec![0.0f32; n_cols],
+                |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
+            )
+    };
+    let sum: Vec<f32> = match pool {
+        Some(p) => p.install(work_sum),
+        None => work_sum(),
+    };
     let mean: Vec<f32> = sum.iter().map(|&s| s / n).collect();
 
     // Pass 2: variance
-    let sq: Vec<f32> = raw
-        .par_chunks(n_cols)
-        .fold(
-            || vec![0.0f32; n_cols],
-            |mut acc, row| {
-                for (j, &v) in row.iter().enumerate() {
-                    let d = v - mean[j];
-                    acc[j] += d * d;
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![0.0f32; n_cols],
-            |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
-        );
+    let work_sq = || {
+        raw.par_chunks(n_cols)
+            .fold(
+                || vec![0.0f32; n_cols],
+                |mut acc, row| {
+                    for (j, &v) in row.iter().enumerate() {
+                        let d = v - mean[j];
+                        acc[j] += d * d;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0f32; n_cols],
+                |mut a, b| { for j in 0..n_cols { a[j] += b[j]; } a },
+            )
+    };
+    let sq: Vec<f32> = match pool {
+        Some(p) => p.install(work_sq),
+        None => work_sq(),
+    };
 
     let inv_std: Vec<f32> = sq.iter().map(|&s| {
         let var = s / n;
@@ -193,14 +247,21 @@ fn std_scaler_apply(
     let n_rows = data.nrows();
     let n_cols = data.ncols();
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
-    out.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(data.axis_iter(Axis(0)))
-        .for_each(|(mut out_row, in_row)| {
-            for j in 0..n_cols {
-                out_row[j] = (in_row[j] - mean[j]) * inv_std[j];
-            }
-        });
+    let pool = get_thread_pool();
+    let mut work = || {
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(data.axis_iter(Axis(0)))
+            .for_each(|(mut out_row, in_row)| {
+                for j in 0..n_cols {
+                    out_row[j] = (in_row[j] - mean[j]) * inv_std[j];
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
     (StandardScalerModel { n_cols, mean, inv_std }, out)
 }
 
@@ -224,14 +285,21 @@ pub fn standard_scaler_transform(
     let n_rows = data.nrows();
     let n_cols = model.n_cols;
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
-    out.axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(data.axis_iter(Axis(0)))
-        .for_each(|(mut out_row, in_row)| {
-            for j in 0..n_cols {
-                out_row[j] = (in_row[j] - model.mean[j]) * model.inv_std[j];
-            }
-        });
+    let pool = get_thread_pool();
+    let mut work = || {
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(data.axis_iter(Axis(0)))
+            .for_each(|(mut out_row, in_row)| {
+                for j in 0..n_cols {
+                    out_row[j] = (in_row[j] - model.mean[j]) * model.inv_std[j];
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
     Ok(out)
 }
 
