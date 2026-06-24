@@ -703,7 +703,12 @@ where
     // pure arithmetic on the buffer; they make no Python API calls, so holding the
     // GIL during this call is safe (same pattern as numpy/BLAS parallel kernels).
     let slice = unsafe { std::slice::from_raw_parts_mut(data.as_array_mut().as_mut_ptr(), len) };
-    slice.par_chunks_mut(n_cols).for_each(f);
+    let pool = get_thread_pool();
+    let mut work = || slice.par_chunks_mut(n_cols).for_each(&f);
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
     Ok(())
 }
 
