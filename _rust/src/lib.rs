@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use ndarray::{Array2, Axis};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyIterator, PyList, PyModule};
 use pyo3::{PyErr, exceptions::PyValueError};
@@ -684,6 +684,30 @@ fn normalize_max_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<
     Ok(Py::from(arr.into_pyarray(py).to_owned()))
 }
 
+// In-place variants: take exclusive mutable access to the caller's numpy
+// buffer directly (no copy in, no copy out) and mutate it row-wise via the
+// same Rayon kernels used by the `*_dense` (copying) variants above.
+#[pyfunction]
+fn normalize_l2_inplace(py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
+    let mut view = data.as_array_mut();
+    py.allow_threads(|| normalize::normalize_l2(&mut view));
+    Ok(())
+}
+
+#[pyfunction]
+fn normalize_l1_inplace(py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
+    let mut view = data.as_array_mut();
+    py.allow_threads(|| normalize::normalize_l1(&mut view));
+    Ok(())
+}
+
+#[pyfunction]
+fn normalize_max_inplace(py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
+    let mut view = data.as_array_mut();
+    py.allow_threads(|| normalize::normalize_max(&mut view));
+    Ok(())
+}
+
 #[pyfunction]
 fn min_max_fit_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<(u64, Py<PyArray2<f32>>)> {
     let arr = data.as_array().to_owned();
@@ -764,6 +788,9 @@ fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(normalize_l2_dense, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_l1_dense, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_max_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_l2_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_l1_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_max_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(min_max_fit_dense, m)?)?;
     m.add_function(wrap_pyfunction!(min_max_transform_dense, m)?)?;
     m.add_function(wrap_pyfunction!(standard_scaler_fit_dense, m)?)?;

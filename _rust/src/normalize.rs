@@ -1,10 +1,15 @@
-use ndarray::{Array2, Axis};
+use ndarray::{Array2, ArrayBase, Axis, DataMut, Ix2};
 use rayon::prelude::*;
 use crate::threads::get_thread_pool;
 
 // ---- Stateless row-wise normalizations ----
+//
+// Generic over the underlying storage (`DataMut`) so the same row-wise
+// kernel works both on an owned `Array2<f32>` (copying Python bindings)
+// and on an `ArrayViewMut2<f32>` borrowed straight from a numpy buffer
+// (zero-allocation in-place bindings) — see `*_inplace` in lib.rs.
 
-pub fn normalize_l2(data: &mut Array2<f32>) {
+pub fn normalize_l2<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
     let pool = get_thread_pool();
     let mut work = || {
         data.axis_iter_mut(Axis(0))
@@ -23,7 +28,7 @@ pub fn normalize_l2(data: &mut Array2<f32>) {
     }
 }
 
-pub fn normalize_l1(data: &mut Array2<f32>) {
+pub fn normalize_l1<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
     let pool = get_thread_pool();
     let mut work = || {
         data.axis_iter_mut(Axis(0))
@@ -42,7 +47,7 @@ pub fn normalize_l1(data: &mut Array2<f32>) {
     }
 }
 
-pub fn normalize_max(data: &mut Array2<f32>) {
+pub fn normalize_max<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
     let pool = get_thread_pool();
     let mut work = || {
         data.axis_iter_mut(Axis(0))

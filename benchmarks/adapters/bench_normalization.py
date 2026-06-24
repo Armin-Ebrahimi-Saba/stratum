@@ -70,6 +70,22 @@ def warmup(fn, n: int = 3):
     gc.collect()
 
 
+def timeit_inplace(make_buf, fn, n_reps: int = 5) -> float:
+    """Like timeit, but rebuilds the (mutated) buffer before each rep so the
+    copy cost stays outside the timed region."""
+    for _ in range(3):
+        fn(make_buf())
+    gc.collect()
+    times = []
+    for _ in range(n_reps):
+        buf = make_buf()
+        gc.collect()
+        t0 = time.perf_counter()
+        fn(buf)
+        times.append(time.perf_counter() - t0)
+    return float(np.median(times))
+
+
 # ── per-kernel benchmark ──────────────────────────────────────────────────────
 
 def bench_normalize(data: np.ndarray, n_reps: int) -> dict:
@@ -85,6 +101,28 @@ def bench_normalize(data: np.ndarray, n_reps: int) -> dict:
         rust_t = timeit(lambda: rust_fn(data), n_reps)
 
         results[f"normalize_{norm}"] = (sklearn_t, rust_t)
+
+    return results
+
+
+def bench_normalize_inplace(data: np.ndarray, n_reps: int) -> dict:
+    results = {}
+
+    for norm in ("l2", "l1", "max"):
+        rust_fn = {
+            "l2": rb.normalize_l2_inplace,
+            "l1": rb.normalize_l1_inplace,
+            "max": rb.normalize_max_inplace,
+        }[norm]
+
+        sklearn_t = timeit_inplace(
+            lambda: data.copy(),
+            lambda buf: normalize(buf, norm=norm, copy=False),
+            n_reps,
+        )
+        rust_t = timeit_inplace(lambda: data.copy(), rust_fn, n_reps)
+
+        results[f"normalize_{norm}_inplace"] = (sklearn_t, rust_t)
 
     return results
 
@@ -187,6 +225,8 @@ def run_suite(sizes: list[tuple[int, int]], n_reps: int):
         print_header()
 
         for name, (sk, ru) in bench_normalize(data, n_reps).items():
+            print_row(name, sk, ru)
+        for name, (sk, ru) in bench_normalize_inplace(data, n_reps).items():
             print_row(name, sk, ru)
         for name, (sk, ru) in bench_min_max(data, n_reps).items():
             print_row(name, sk, ru)
