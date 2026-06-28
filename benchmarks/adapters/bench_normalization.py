@@ -152,6 +152,19 @@ def bench_min_max(data: np.ndarray, n_reps: int) -> dict:
 
     results["min_max_transform"] = (sklearn_tr_t, rust_tr_t)
 
+    # transform in-place (overwrite the caller's buffer). Both sides mutate, so
+    # each rep gets a fresh, un-transformed input via timeit_inplace; the rebuild
+    # cost stays outside the timed region.
+    sk_ip = MinMaxScaler(copy=False).fit(data)
+    sklearn_tr_ip_t = timeit_inplace(
+        lambda: data.copy(), lambda buf: sk_ip.transform(buf), n_reps
+    )
+    rust_tr_ip_t = timeit_inplace(
+        lambda: data.copy(), lambda buf: rb.min_max_transform_inplace(model_id, buf), n_reps
+    )
+
+    results["min_max_transform_inplace"] = (sklearn_tr_ip_t, rust_tr_ip_t)
+
     return results
 
 
@@ -178,6 +191,18 @@ def bench_standard_scaler(data: np.ndarray, n_reps: int) -> dict:
     rust_tr_t = timeit(lambda: rb.standard_scaler_transform(model_id, data), n_reps)
 
     results["standard_scaler_transform"] = (sklearn_tr_t, rust_tr_t)
+
+    # transform in-place (overwrite the caller's buffer). Fresh input each rep
+    # via timeit_inplace since both sides mutate their argument.
+    sk_ip = StandardScaler(copy=False).fit(data)
+    sklearn_tr_ip_t = timeit_inplace(
+        lambda: data.copy(), lambda buf: sk_ip.transform(buf), n_reps
+    )
+    rust_tr_ip_t = timeit_inplace(
+        lambda: data.copy(), lambda buf: rb.standard_scaler_transform_inplace(model_id, buf), n_reps
+    )
+
+    results["standard_scaler_transform_inplace"] = (sklearn_tr_ip_t, rust_tr_ip_t)
 
     return results
 

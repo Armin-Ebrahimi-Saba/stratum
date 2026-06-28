@@ -85,3 +85,5 @@ min_max_fit = getattr(native, "min_max_fit_dense", None) if native else None
 min_max_transform = getattr(native, "min_max_transform_dense", None) if native else None
 standard_scaler_fit = getattr(native, "standard_scaler_fit_dense", None) if native else None
 standard_scaler_transform = getattr(native, "standard_scaler_transform_dense", None) if native else None
+min_max_transform_inplace = getattr(native, "min_max_transform_inplace", None) if native else None
+standard_scaler_transform_inplace = getattr(native, "standard_scaler_transform_inplace", None) if native else None

@@ -665,23 +665,23 @@ fn tfidf_transform_csr(
 
 #[pyfunction]
 fn normalize_l2_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<Py<PyArray2<f32>>> {
-    let mut arr = data.as_array().to_owned();
-    py.allow_threads(|| normalize::normalize_l2(&mut arr));
-    Ok(Py::from(arr.into_pyarray(py).to_owned()))
+    let arr = data.as_array();
+    let out = py.allow_threads(|| normalize::normalize_l2(arr));
+    Ok(Py::from(out.into_pyarray(py).to_owned()))
 }
 
 #[pyfunction]
 fn normalize_l1_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<Py<PyArray2<f32>>> {
-    let mut arr = data.as_array().to_owned();
-    py.allow_threads(|| normalize::normalize_l1(&mut arr));
-    Ok(Py::from(arr.into_pyarray(py).to_owned()))
+    let arr = data.as_array();
+    let out = py.allow_threads(|| normalize::normalize_l1(arr));
+    Ok(Py::from(out.into_pyarray(py).to_owned()))
 }
 
 #[pyfunction]
 fn normalize_max_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<Py<PyArray2<f32>>> {
-    let mut arr = data.as_array().to_owned();
-    py.allow_threads(|| normalize::normalize_max(&mut arr));
-    Ok(Py::from(arr.into_pyarray(py).to_owned()))
+    let arr = data.as_array();
+    let out = py.allow_threads(|| normalize::normalize_max(arr));
+    Ok(Py::from(out.into_pyarray(py).to_owned()))
 }
 
 // In-place variants: take exclusive mutable access to the caller's numpy
@@ -690,21 +690,21 @@ fn normalize_max_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<
 #[pyfunction]
 fn normalize_l2_inplace(py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
     let mut view = data.as_array_mut();
-    py.allow_threads(|| normalize::normalize_l2(&mut view));
+    py.allow_threads(|| normalize::normalize_l2_inplace(&mut view));
     Ok(())
 }
 
 #[pyfunction]
 fn normalize_l1_inplace(py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
     let mut view = data.as_array_mut();
-    py.allow_threads(|| normalize::normalize_l1(&mut view));
+    py.allow_threads(|| normalize::normalize_l1_inplace(&mut view));
     Ok(())
 }
 
 #[pyfunction]
 fn normalize_max_inplace(py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> PyResult<()> {
     let mut view = data.as_array_mut();
-    py.allow_threads(|| normalize::normalize_max(&mut view));
+    py.allow_threads(|| normalize::normalize_max_inplace(&mut view));
     Ok(())
 }
 
@@ -772,6 +772,42 @@ fn standard_scaler_transform_dense(
     Ok(Py::from(out.into_pyarray(py).to_owned()))
 }
 
+#[pyfunction]
+fn min_max_transform_inplace(
+    py: Python<'_>,
+    model_id: u64,
+    mut data: PyReadwriteArray2<f32>,
+) -> PyResult<()> {
+    let mut view = data.as_array_mut();
+    let guard = MIN_MAX_MODELS
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("MIN_MAX_MODELS mutex poisoned"))?;
+    let model = guard
+        .get(&model_id)
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("Unknown model_id {model_id}")))?;
+    py.allow_threads(|| normalize::min_max_transform_inplace(&mut view, model))
+        .map_err(|e| PyErr::new::<PyValueError, _>(e))?;
+    Ok(())
+}
+
+#[pyfunction]
+fn standard_scaler_transform_inplace(
+    py: Python<'_>,
+    model_id: u64,
+    mut data: PyReadwriteArray2<f32>,
+) -> PyResult<()> {
+    let mut view = data.as_array_mut();
+    let guard = STD_SCALER_MODELS
+        .lock()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("STD_SCALER_MODELS mutex poisoned"))?;
+    let model = guard
+        .get(&model_id)
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("Unknown model_id {model_id}")))?;
+    py.allow_threads(|| normalize::standard_scaler_transform_inplace(&mut view, model))
+        .map_err(|e| PyErr::new::<PyValueError, _>(e))?;
+    Ok(())
+}
+
 // ---- Expose module ----
 #[pymodule]
 fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
@@ -795,5 +831,7 @@ fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(min_max_transform_dense, m)?)?;
     m.add_function(wrap_pyfunction!(standard_scaler_fit_dense, m)?)?;
     m.add_function(wrap_pyfunction!(standard_scaler_transform_dense, m)?)?;
+    m.add_function(wrap_pyfunction!(min_max_transform_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(standard_scaler_transform_inplace, m)?)?;
     Ok(())
 }

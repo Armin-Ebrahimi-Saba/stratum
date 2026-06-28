@@ -1,15 +1,19 @@
-use ndarray::{Array2, ArrayBase, Axis, DataMut, Ix2};
+use ndarray::{Array2, ArrayBase, ArrayView2, Axis, DataMut, Ix2};
 use rayon::prelude::*;
 use crate::threads::get_thread_pool;
 
 // ---- Stateless row-wise normalizations ----
 //
-// Generic over the underlying storage (`DataMut`) so the same row-wise
-// kernel works both on an owned `Array2<f32>` (copying Python bindings)
-// and on an `ArrayViewMut2<f32>` borrowed straight from a numpy buffer
-// (zero-allocation in-place bindings) — see `*_inplace` in lib.rs.
+// Each norm comes in two flavours:
+//   * `normalize_*`         — copy-returning: read `src` and write the
+//                             normalized result into a freshly allocated output
+//                             in a single pass (uninitialized output, written
+//                             exactly once, so net RAM traffic is 1 read + 1
+//                             write per element).
+//   * `normalize_*_inplace` — generic over `DataMut`, mutating the buffer in
+//                             place; used by the zero-allocation numpy bindings.
 
-pub fn normalize_l2<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
+pub fn normalize_l2_inplace<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
     let pool = get_thread_pool();
     let mut work = || {
         data.axis_iter_mut(Axis(0))
@@ -28,7 +32,48 @@ pub fn normalize_l2<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S
     }
 }
 
-pub fn normalize_l1<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
+// Copy-returning L2 normalize: reads `src` and writes the normalized result
+// straight into a freshly allocated output in a single pass. Avoids the
+// redundant `to_owned()` copy the binding used to make (which read the input and
+// wrote a raw duplicate, only to overwrite every element again). The output is
+// allocated uninitialized — every element is written exactly once below — so
+// there's no zero-fill pass either: net RAM traffic is 1 read + 1 write per
+// element (2N) instead of the old 4N.
+pub fn normalize_l2(src: ArrayView2<f32>) -> Array2<f32> {
+    let n_rows = src.nrows();
+    let n_cols = src.ncols();
+    let mut out = Array2::<f32>::uninit((n_rows, n_cols));
+    let pool = get_thread_pool();
+    let mut work = || {
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(src.axis_iter(Axis(0)))
+            .for_each(|(mut out_row, in_row)| {
+                let norm_sq: f32 = in_row.iter().map(|x| x * x).sum();
+                if norm_sq > 0.0 {
+                    let inv = 1.0 / norm_sq.sqrt();
+                    for (o, &x) in out_row.iter_mut().zip(in_row.iter()) {
+                        o.write(x * inv);
+                    }
+                } else {
+                    // All-zero (or underflowing) row: pass through unchanged,
+                    // matching the in-place kernel's semantics.
+                    for (o, &x) in out_row.iter_mut().zip(in_row.iter()) {
+                        o.write(x);
+                    }
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
+    // SAFETY: every element of `out` was written exactly once above (each row is
+    // fully traversed in one of the two branches).
+    unsafe { out.assume_init() }
+}
+
+pub fn normalize_l1_inplace<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
     let pool = get_thread_pool();
     let mut work = || {
         data.axis_iter_mut(Axis(0))
@@ -47,7 +92,7 @@ pub fn normalize_l1<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S
     }
 }
 
-pub fn normalize_max<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
+pub fn normalize_max_inplace<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<S, Ix2>) {
     let pool = get_thread_pool();
     let mut work = || {
         data.axis_iter_mut(Axis(0))
@@ -64,6 +109,72 @@ pub fn normalize_max<S: DataMut<Elem = f32> + Sync + Send>(data: &mut ArrayBase<
         Some(p) => p.install(work),
         None => work(),
     }
+}
+
+// Copy-returning L1 normalize (counterpart to in-place `normalize_l1_inplace`).
+// Single pass, uninitialized output written exactly once. See `normalize_l2`.
+pub fn normalize_l1(src: ArrayView2<f32>) -> Array2<f32> {
+    let n_rows = src.nrows();
+    let n_cols = src.ncols();
+    let mut out = Array2::<f32>::uninit((n_rows, n_cols));
+    let pool = get_thread_pool();
+    let mut work = || {
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(src.axis_iter(Axis(0)))
+            .for_each(|(mut out_row, in_row)| {
+                let norm: f32 = in_row.iter().map(|x| x.abs()).sum();
+                if norm > 0.0 {
+                    let inv = 1.0 / norm;
+                    for (o, &x) in out_row.iter_mut().zip(in_row.iter()) {
+                        o.write(x * inv);
+                    }
+                } else {
+                    for (o, &x) in out_row.iter_mut().zip(in_row.iter()) {
+                        o.write(x);
+                    }
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
+    // SAFETY: every element of `out` is written exactly once above.
+    unsafe { out.assume_init() }
+}
+
+// Copy-returning max normalize (counterpart to in-place `normalize_max_inplace`).
+// Single pass, uninitialized output written exactly once. See `normalize_l2`.
+pub fn normalize_max(src: ArrayView2<f32>) -> Array2<f32> {
+    let n_rows = src.nrows();
+    let n_cols = src.ncols();
+    let mut out = Array2::<f32>::uninit((n_rows, n_cols));
+    let pool = get_thread_pool();
+    let mut work = || {
+        out.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(src.axis_iter(Axis(0)))
+            .for_each(|(mut out_row, in_row)| {
+                let max_abs = in_row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                if max_abs > 0.0 {
+                    let inv = 1.0 / max_abs;
+                    for (o, &x) in out_row.iter_mut().zip(in_row.iter()) {
+                        o.write(x * inv);
+                    }
+                } else {
+                    for (o, &x) in out_row.iter_mut().zip(in_row.iter()) {
+                        o.write(x);
+                    }
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
+    // SAFETY: every element of `out` is written exactly once above.
+    unsafe { out.assume_init() }
 }
 
 // ---- MinMaxScaler (per-column, fits to [0, 1]) ----
@@ -115,7 +226,7 @@ fn min_max_stats_rowwise(data: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
 fn min_max_apply(data: &Array2<f32>, min: Vec<f32>, scale: Vec<f32>) -> (MinMaxModel, Array2<f32>) {
     let n_rows = data.nrows();
     let n_cols = data.ncols();
-    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
+    let mut out = Array2::<f32>::uninit((n_rows, n_cols));
     let pool = get_thread_pool();
     let mut work = || {
         out.axis_iter_mut(Axis(0))
@@ -123,7 +234,7 @@ fn min_max_apply(data: &Array2<f32>, min: Vec<f32>, scale: Vec<f32>) -> (MinMaxM
             .zip(data.axis_iter(Axis(0)))
             .for_each(|(mut out_row, in_row)| {
                 for j in 0..n_cols {
-                    out_row[j] = (in_row[j] - min[j]) * scale[j];
+                    out_row[j].write((in_row[j] - min[j]) * scale[j]);
                 }
             });
     };
@@ -131,6 +242,8 @@ fn min_max_apply(data: &Array2<f32>, min: Vec<f32>, scale: Vec<f32>) -> (MinMaxM
         Some(p) => p.install(work),
         None => work(),
     }
+    // SAFETY: every element of `out` is written exactly once above.
+    let out = unsafe { out.assume_init() };
     (MinMaxModel { n_cols, min, scale }, out)
 }
 
@@ -158,7 +271,7 @@ pub fn min_max_transform(data: &Array2<f32>, model: &MinMaxModel) -> Result<Arra
     }
     let n_rows = data.nrows();
     let n_cols = model.n_cols;
-    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
+    let mut out = Array2::<f32>::uninit((n_rows, n_cols));
     let pool = get_thread_pool();
     let mut work = || {
         out.axis_iter_mut(Axis(0))
@@ -166,7 +279,7 @@ pub fn min_max_transform(data: &Array2<f32>, model: &MinMaxModel) -> Result<Arra
             .zip(data.axis_iter(Axis(0)))
             .for_each(|(mut out_row, in_row)| {
                 for j in 0..n_cols {
-                    out_row[j] = (in_row[j] - model.min[j]) * model.scale[j];
+                    out_row[j].write((in_row[j] - model.min[j]) * model.scale[j]);
                 }
             });
     };
@@ -174,7 +287,41 @@ pub fn min_max_transform(data: &Array2<f32>, model: &MinMaxModel) -> Result<Arra
         Some(p) => p.install(work),
         None => work(),
     }
-    Ok(out)
+    // SAFETY: every element of `out` is written exactly once above.
+    Ok(unsafe { out.assume_init() })
+}
+
+// In-place transform: overwrite the caller's buffer instead of allocating a
+// fresh output. The copy-returning `min_max_transform` is dominated by
+// first-touch page faults on the new buffer; mutating in place skips the
+// allocation entirely, leaving only the (parallel, bandwidth-bound) read+write.
+pub fn min_max_transform_inplace<S: DataMut<Elem = f32> + Sync + Send>(
+    data: &mut ArrayBase<S, Ix2>,
+    model: &MinMaxModel,
+) -> Result<(), String> {
+    if data.ncols() != model.n_cols {
+        return Err(format!(
+            "n_cols mismatch: input has {} columns but model expects {}",
+            data.ncols(),
+            model.n_cols
+        ));
+    }
+    let n_cols = model.n_cols;
+    let pool = get_thread_pool();
+    let mut work = || {
+        data.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut row| {
+                for j in 0..n_cols {
+                    row[j] = (row[j] - model.min[j]) * model.scale[j];
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
+    Ok(())
 }
 
 // ---- StandardScaler (per-column z-score: subtract mean, divide by std) ----
@@ -251,7 +398,7 @@ fn std_scaler_apply(
 ) -> (StandardScalerModel, Array2<f32>) {
     let n_rows = data.nrows();
     let n_cols = data.ncols();
-    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
+    let mut out = Array2::<f32>::uninit((n_rows, n_cols));
     let pool = get_thread_pool();
     let mut work = || {
         out.axis_iter_mut(Axis(0))
@@ -259,7 +406,7 @@ fn std_scaler_apply(
             .zip(data.axis_iter(Axis(0)))
             .for_each(|(mut out_row, in_row)| {
                 for j in 0..n_cols {
-                    out_row[j] = (in_row[j] - mean[j]) * inv_std[j];
+                    out_row[j].write((in_row[j] - mean[j]) * inv_std[j]);
                 }
             });
     };
@@ -267,6 +414,8 @@ fn std_scaler_apply(
         Some(p) => p.install(work),
         None => work(),
     }
+    // SAFETY: every element of `out` is written exactly once above.
+    let out = unsafe { out.assume_init() };
     (StandardScalerModel { n_cols, mean, inv_std }, out)
 }
 
@@ -289,7 +438,7 @@ pub fn standard_scaler_transform(
     }
     let n_rows = data.nrows();
     let n_cols = model.n_cols;
-    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
+    let mut out = Array2::<f32>::uninit((n_rows, n_cols));
     let pool = get_thread_pool();
     let mut work = || {
         out.axis_iter_mut(Axis(0))
@@ -297,7 +446,7 @@ pub fn standard_scaler_transform(
             .zip(data.axis_iter(Axis(0)))
             .for_each(|(mut out_row, in_row)| {
                 for j in 0..n_cols {
-                    out_row[j] = (in_row[j] - model.mean[j]) * model.inv_std[j];
+                    out_row[j].write((in_row[j] - model.mean[j]) * model.inv_std[j]);
                 }
             });
     };
@@ -305,7 +454,40 @@ pub fn standard_scaler_transform(
         Some(p) => p.install(work),
         None => work(),
     }
-    Ok(out)
+    // SAFETY: every element of `out` is written exactly once above.
+    Ok(unsafe { out.assume_init() })
+}
+
+// In-place transform: overwrite the caller's buffer (see
+// `min_max_transform_inplace` for the rationale — avoids the fresh-allocation
+// page-fault cost that makes the copy-returning transform memory-bound).
+pub fn standard_scaler_transform_inplace<S: DataMut<Elem = f32> + Sync + Send>(
+    data: &mut ArrayBase<S, Ix2>,
+    model: &StandardScalerModel,
+) -> Result<(), String> {
+    if data.ncols() != model.n_cols {
+        return Err(format!(
+            "n_cols mismatch: input has {} columns but model expects {}",
+            data.ncols(),
+            model.n_cols
+        ));
+    }
+    let n_cols = model.n_cols;
+    let pool = get_thread_pool();
+    let mut work = || {
+        data.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut row| {
+                for j in 0..n_cols {
+                    row[j] = (row[j] - model.mean[j]) * model.inv_std[j];
+                }
+            });
+    };
+    match pool {
+        Some(p) => p.install(work),
+        None => work(),
+    }
+    Ok(())
 }
 
 // ---- Unit tests ----
@@ -320,7 +502,7 @@ mod tests {
     #[test]
     fn l2_unit_norm() {
         let mut data = array![[3.0f32, 4.0], [1.0, 0.0], [0.0, 0.0]];
-        normalize_l2(&mut data);
+        normalize_l2_inplace(&mut data);
         // Row 0: norm = 5, so [0.6, 0.8]
         assert!((data[[0, 0]] - 0.6).abs() < EPS);
         assert!((data[[0, 1]] - 0.8).abs() < EPS);
@@ -332,9 +514,24 @@ mod tests {
     }
 
     #[test]
+    fn l2_copy_matches_inplace() {
+        let data = array![[3.0f32, 4.0], [1.0, 0.0], [0.0, 0.0]];
+        let out = normalize_l2(data.view());
+        let mut inplace = data.clone();
+        normalize_l2_inplace(&mut inplace);
+        for (a, b) in out.iter().zip(inplace.iter()) {
+            assert!((a - b).abs() < EPS);
+        }
+        // Spot-check absolute values too.
+        assert!((out[[0, 0]] - 0.6).abs() < EPS);
+        assert!((out[[0, 1]] - 0.8).abs() < EPS);
+        assert!((out[[2, 0]] - 0.0).abs() < EPS);
+    }
+
+    #[test]
     fn l1_unit_norm() {
         let mut data = array![[3.0f32, 1.0], [-2.0, 2.0], [0.0, 0.0]];
-        normalize_l1(&mut data);
+        normalize_l1_inplace(&mut data);
         // Row 0: L1 = 4, so [0.75, 0.25]
         assert!((data[[0, 0]] - 0.75).abs() < EPS);
         assert!((data[[0, 1]] - 0.25).abs() < EPS);
@@ -346,9 +543,31 @@ mod tests {
     }
 
     #[test]
+    fn l1_copy_matches_inplace() {
+        let data = array![[3.0f32, 1.0], [-2.0, 2.0], [0.0, 0.0]];
+        let out = normalize_l1(data.view());
+        let mut inplace = data.clone();
+        normalize_l1_inplace(&mut inplace);
+        for (a, b) in out.iter().zip(inplace.iter()) {
+            assert!((a - b).abs() < EPS);
+        }
+    }
+
+    #[test]
+    fn max_copy_matches_inplace() {
+        let data = array![[2.0f32, -6.0, 3.0], [0.0, 0.0, 0.0]];
+        let out = normalize_max(data.view());
+        let mut inplace = data.clone();
+        normalize_max_inplace(&mut inplace);
+        for (a, b) in out.iter().zip(inplace.iter()) {
+            assert!((a - b).abs() < EPS);
+        }
+    }
+
+    #[test]
     fn max_unit_norm() {
         let mut data = array![[2.0f32, -6.0, 3.0], [0.0, 0.0, 0.0]];
-        normalize_max(&mut data);
+        normalize_max_inplace(&mut data);
         // Row 0: max_abs = 6, so [1/3, -1.0, 0.5]
         assert!((data[[0, 0]] - (2.0 / 6.0)).abs() < EPS);
         assert!((data[[0, 1]] + 1.0).abs() < EPS);
@@ -431,6 +650,44 @@ mod tests {
         for (a, b) in fit_out.iter().zip(transform_out.iter()) {
             assert!((a - b).abs() < EPS);
         }
+    }
+
+    #[test]
+    fn min_max_transform_inplace_matches() {
+        let train = array![[0.0f32, 0.0], [10.0, 100.0], [5.0, 50.0]];
+        let (model, fit_out) = min_max_fit(&train);
+        let mut x = train.clone();
+        min_max_transform_inplace(&mut x, &model).unwrap();
+        for (a, b) in x.iter().zip(fit_out.iter()) {
+            assert!((a - b).abs() < EPS);
+        }
+    }
+
+    #[test]
+    fn min_max_transform_inplace_ncols_mismatch() {
+        let train = array![[0.0f32, 0.0], [1.0, 1.0]];
+        let (model, _) = min_max_fit(&train);
+        let mut bad = array![[0.0f32, 0.0, 0.0]];
+        assert!(min_max_transform_inplace(&mut bad, &model).is_err());
+    }
+
+    #[test]
+    fn standard_scaler_transform_inplace_matches() {
+        let train = array![[1.0f32, 10.0], [3.0, 30.0], [2.0, 20.0]];
+        let (model, fit_out) = standard_scaler_fit(&train);
+        let mut x = train.clone();
+        standard_scaler_transform_inplace(&mut x, &model).unwrap();
+        for (a, b) in x.iter().zip(fit_out.iter()) {
+            assert!((a - b).abs() < EPS);
+        }
+    }
+
+    #[test]
+    fn standard_scaler_transform_inplace_ncols_mismatch() {
+        let train = array![[0.0f32, 0.0], [1.0, 1.0]];
+        let (model, _) = standard_scaler_fit(&train);
+        let mut bad = array![[0.0f32]];
+        assert!(standard_scaler_transform_inplace(&mut bad, &model).is_err());
     }
 
     #[test]
