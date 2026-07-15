@@ -53,12 +53,6 @@ struct FdEmbedModel {
 static FD_EMBED_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static FD_EMBED_MODELS: Lazy<Mutex<HashMap<u64, FdEmbedModel>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-static MIN_MAX_NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static MIN_MAX_MODELS: Lazy<Mutex<HashMap<u64, normalize::MinMaxModel>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-
-static STD_SCALER_NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static STD_SCALER_MODELS: Lazy<Mutex<HashMap<u64, normalize::StandardScalerModel>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-
 // Simple mapping from domain error to PyErr
 fn to_pyerr(err: tfidf::Error) -> PyErr {
     use tfidf::Error::*;
@@ -708,106 +702,6 @@ fn normalize_max_inplace(py: Python<'_>, mut data: PyReadwriteArray2<f32>) -> Py
     Ok(())
 }
 
-#[pyfunction]
-fn min_max_fit_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<(u64, Py<PyArray2<f32>>)> {
-    let arr = data.as_array().to_owned();
-    let (model, out) = py.allow_threads(|| normalize::min_max_fit(&arr));
-    let model_id = MIN_MAX_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    MIN_MAX_MODELS
-        .lock()
-        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("MIN_MAX_MODELS mutex poisoned"))?
-        .insert(model_id, model);
-    Ok((model_id, Py::from(out.into_pyarray(py).to_owned())))
-}
-
-#[pyfunction]
-fn min_max_transform_dense(
-    py: Python<'_>,
-    model_id: u64,
-    data: PyReadonlyArray2<f32>,
-) -> PyResult<Py<PyArray2<f32>>> {
-    let arr = data.as_array().to_owned();
-    let out = {
-        let guard = MIN_MAX_MODELS
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("MIN_MAX_MODELS mutex poisoned"))?;
-        let model = guard
-            .get(&model_id)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("Unknown model_id {model_id}")))?;
-        py.allow_threads(|| normalize::min_max_transform(&arr, model))
-            .map_err(|e| PyErr::new::<PyValueError, _>(e))?
-    };
-    Ok(Py::from(out.into_pyarray(py).to_owned()))
-}
-
-#[pyfunction]
-fn standard_scaler_fit_dense(py: Python<'_>, data: PyReadonlyArray2<f32>) -> PyResult<(u64, Py<PyArray2<f32>>)> {
-    let arr = data.as_array().to_owned();
-    let (model, out) = py.allow_threads(|| normalize::standard_scaler_fit(&arr));
-    let model_id = STD_SCALER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    STD_SCALER_MODELS
-        .lock()
-        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("STD_SCALER_MODELS mutex poisoned"))?
-        .insert(model_id, model);
-    Ok((model_id, Py::from(out.into_pyarray(py).to_owned())))
-}
-
-#[pyfunction]
-fn standard_scaler_transform_dense(
-    py: Python<'_>,
-    model_id: u64,
-    data: PyReadonlyArray2<f32>,
-) -> PyResult<Py<PyArray2<f32>>> {
-    let arr = data.as_array().to_owned();
-    let out = {
-        let guard = STD_SCALER_MODELS
-            .lock()
-            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("STD_SCALER_MODELS mutex poisoned"))?;
-        let model = guard
-            .get(&model_id)
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("Unknown model_id {model_id}")))?;
-        py.allow_threads(|| normalize::standard_scaler_transform(&arr, model))
-            .map_err(|e| PyErr::new::<PyValueError, _>(e))?
-    };
-    Ok(Py::from(out.into_pyarray(py).to_owned()))
-}
-
-#[pyfunction]
-fn min_max_transform_inplace(
-    py: Python<'_>,
-    model_id: u64,
-    mut data: PyReadwriteArray2<f32>,
-) -> PyResult<()> {
-    let mut view = data.as_array_mut();
-    let guard = MIN_MAX_MODELS
-        .lock()
-        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("MIN_MAX_MODELS mutex poisoned"))?;
-    let model = guard
-        .get(&model_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("Unknown model_id {model_id}")))?;
-    py.allow_threads(|| normalize::min_max_transform_inplace(&mut view, model))
-        .map_err(|e| PyErr::new::<PyValueError, _>(e))?;
-    Ok(())
-}
-
-#[pyfunction]
-fn standard_scaler_transform_inplace(
-    py: Python<'_>,
-    model_id: u64,
-    mut data: PyReadwriteArray2<f32>,
-) -> PyResult<()> {
-    let mut view = data.as_array_mut();
-    let guard = STD_SCALER_MODELS
-        .lock()
-        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("STD_SCALER_MODELS mutex poisoned"))?;
-    let model = guard
-        .get(&model_id)
-        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("Unknown model_id {model_id}")))?;
-    py.allow_threads(|| normalize::standard_scaler_transform_inplace(&mut view, model))
-        .map_err(|e| PyErr::new::<PyValueError, _>(e))?;
-    Ok(())
-}
-
 // ---- Expose module ----
 #[pymodule]
 fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
@@ -827,11 +721,5 @@ fn _rust_backend_native(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(normalize_l2_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_l1_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_max_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(min_max_fit_dense, m)?)?;
-    m.add_function(wrap_pyfunction!(min_max_transform_dense, m)?)?;
-    m.add_function(wrap_pyfunction!(standard_scaler_fit_dense, m)?)?;
-    m.add_function(wrap_pyfunction!(standard_scaler_transform_dense, m)?)?;
-    m.add_function(wrap_pyfunction!(min_max_transform_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(standard_scaler_transform_inplace, m)?)?;
     Ok(())
 }

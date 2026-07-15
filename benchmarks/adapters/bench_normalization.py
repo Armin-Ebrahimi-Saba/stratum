@@ -1,17 +1,23 @@
 """
 Benchmark: Rust normalization kernels vs. sklearn equivalents.
 
+Metrics: sklearn time, rust time, speedup, and a correctness check comparing the
+Rust output against sklearn's element-wise.
+
 Kernels compared
 ----------------
   normalize_l2    sklearn.preprocessing.normalize(X, norm='l2')
   normalize_l1    sklearn.preprocessing.normalize(X, norm='l1')
   normalize_max   sklearn.preprocessing.normalize(X, norm='max')
-  min_max fit     MinMaxScaler().fit_transform(X)
-  min_max transform MinMaxScaler().transform(X)    (pre-fitted)
-  std_scaler fit  StandardScaler().fit_transform(X)
-  std_scaler transform StandardScaler().transform(X)  (pre-fitted)
+  (each also has an in-place variant)
 
 All inputs are float32. Results are printed as a table.
+
+Correctness
+-----------
+Each kernel's Rust output is compared to sklearn's with
+np.allclose(rtol=1e-3, atol=1e-4); the table shows PASS/FAIL and the max
+absolute error. Pass --no-verify to skip the check.
 
 Usage
 -----
@@ -20,6 +26,9 @@ Usage
 
     # Larger sizes:
     uv run python benchmarks/adapters/bench_normalization.py --large
+
+    # Skip the correctness check:
+    uv run python benchmarks/adapters/bench_normalization.py --no-verify
 """
 import os
 os.environ["SKRUB_RUST"] = "1"
@@ -30,7 +39,7 @@ import sys
 import time
 
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler, StandardScaler, normalize
+from sklearn.preprocessing import normalize
 
 from stratum import _rust_backend as rb
 
@@ -40,6 +49,10 @@ if not rb.HAVE_RUST:
         "Rust backend not built. Run:\n"
         "  cd _rust && maturin develop --release"
     )
+
+# ── correctness tolerances ────────────────────────────────────────────────────
+VERIFY_RTOL = 1e-3
+VERIFY_ATOL = 1e-4
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -86,9 +99,21 @@ def timeit_inplace(make_buf, fn, n_reps: int = 5) -> float:
     return float(np.median(times))
 
 
+def verify_arrays(rust_out, sklearn_out) -> dict:
+    """Compare a Rust kernel's output against sklearn's element-wise."""
+    ru = np.asarray(rust_out, dtype=np.float64)
+    sk = np.asarray(sklearn_out, dtype=np.float64)
+    diff = np.abs(ru - sk)
+    return {
+        "passed":  bool(np.allclose(ru, sk, rtol=VERIFY_RTOL, atol=VERIFY_ATOL)),
+        "max_abs": float(diff.max()),
+        "max_rel": float((diff / (np.abs(sk) + 1e-6)).max()),
+    }
+
+
 # ── per-kernel benchmark ──────────────────────────────────────────────────────
 
-def bench_normalize(data: np.ndarray, n_reps: int) -> dict:
+def bench_normalize(data: np.ndarray, n_reps: int, verify: bool) -> dict:
     results = {}
 
     for norm in ("l2", "l1", "max"):
@@ -100,12 +125,13 @@ def bench_normalize(data: np.ndarray, n_reps: int) -> dict:
         warmup(lambda: rust_fn(data))
         rust_t = timeit(lambda: rust_fn(data), n_reps)
 
-        results[f"normalize_{norm}"] = (sklearn_t, rust_t)
+        v = verify_arrays(rust_fn(data), normalize(data, norm=norm, copy=True)) if verify else None
+        results[f"normalize_{norm}"] = (sklearn_t, rust_t, v)
 
     return results
 
 
-def bench_normalize_inplace(data: np.ndarray, n_reps: int) -> dict:
+def bench_normalize_inplace(data: np.ndarray, n_reps: int, verify: bool) -> dict:
     results = {}
 
     for norm in ("l2", "l1", "max"):
@@ -122,87 +148,12 @@ def bench_normalize_inplace(data: np.ndarray, n_reps: int) -> dict:
         )
         rust_t = timeit_inplace(lambda: data.copy(), rust_fn, n_reps)
 
-        results[f"normalize_{norm}_inplace"] = (sklearn_t, rust_t)
-
-    return results
-
-
-def bench_min_max(data: np.ndarray, n_reps: int) -> dict:
-    results = {}
-
-    # fit (fit_transform, sklearn has no separate fit that returns output)
-    sk = MinMaxScaler()
-    warmup(lambda: MinMaxScaler().fit_transform(data))
-    sklearn_fit_t = timeit(lambda: MinMaxScaler().fit_transform(data), n_reps)
-
-    warmup(lambda: rb.min_max_fit(data))
-    rust_fit_t = timeit(lambda: rb.min_max_fit(data), n_reps)
-
-    results["min_max_fit"] = (sklearn_fit_t, rust_fit_t)
-
-    # transform (re-use already fitted model)
-    sk = MinMaxScaler().fit(data)
-    model_id, _ = rb.min_max_fit(data)
-
-    warmup(lambda: sk.transform(data))
-    sklearn_tr_t = timeit(lambda: sk.transform(data), n_reps)
-
-    warmup(lambda: rb.min_max_transform(model_id, data))
-    rust_tr_t = timeit(lambda: rb.min_max_transform(model_id, data), n_reps)
-
-    results["min_max_transform"] = (sklearn_tr_t, rust_tr_t)
-
-    # transform in-place (overwrite the caller's buffer). Both sides mutate, so
-    # each rep gets a fresh, un-transformed input via timeit_inplace; the rebuild
-    # cost stays outside the timed region.
-    sk_ip = MinMaxScaler(copy=False).fit(data)
-    sklearn_tr_ip_t = timeit_inplace(
-        lambda: data.copy(), lambda buf: sk_ip.transform(buf), n_reps
-    )
-    rust_tr_ip_t = timeit_inplace(
-        lambda: data.copy(), lambda buf: rb.min_max_transform_inplace(model_id, buf), n_reps
-    )
-
-    results["min_max_transform_inplace"] = (sklearn_tr_ip_t, rust_tr_ip_t)
-
-    return results
-
-
-def bench_standard_scaler(data: np.ndarray, n_reps: int) -> dict:
-    results = {}
-
-    # fit
-    warmup(lambda: StandardScaler().fit_transform(data))
-    sklearn_fit_t = timeit(lambda: StandardScaler().fit_transform(data), n_reps)
-
-    warmup(lambda: rb.standard_scaler_fit(data))
-    rust_fit_t = timeit(lambda: rb.standard_scaler_fit(data), n_reps)
-
-    results["standard_scaler_fit"] = (sklearn_fit_t, rust_fit_t)
-
-    # transform
-    sk = StandardScaler().fit(data)
-    model_id, _ = rb.standard_scaler_fit(data)
-
-    warmup(lambda: sk.transform(data))
-    sklearn_tr_t = timeit(lambda: sk.transform(data), n_reps)
-
-    warmup(lambda: rb.standard_scaler_transform(model_id, data))
-    rust_tr_t = timeit(lambda: rb.standard_scaler_transform(model_id, data), n_reps)
-
-    results["standard_scaler_transform"] = (sklearn_tr_t, rust_tr_t)
-
-    # transform in-place (overwrite the caller's buffer). Fresh input each rep
-    # via timeit_inplace since both sides mutate their argument.
-    sk_ip = StandardScaler(copy=False).fit(data)
-    sklearn_tr_ip_t = timeit_inplace(
-        lambda: data.copy(), lambda buf: sk_ip.transform(buf), n_reps
-    )
-    rust_tr_ip_t = timeit_inplace(
-        lambda: data.copy(), lambda buf: rb.standard_scaler_transform_inplace(model_id, buf), n_reps
-    )
-
-    results["standard_scaler_transform_inplace"] = (sklearn_tr_ip_t, rust_tr_ip_t)
+        v = None
+        if verify:
+            buf = data.copy()
+            rust_fn(buf)
+            v = verify_arrays(buf, normalize(data, norm=norm, copy=True))
+        results[f"normalize_{norm}_inplace"] = (sklearn_t, rust_t, v)
 
     return results
 
@@ -221,51 +172,65 @@ def print_header():
         f"{'sklearn':>{COL_W}}"
         f"{'rust':>{COL_W}}"
         f"{'speedup':>{COL_W}}"
+        f"{'correctness':>{COL_W}}"
     )
     print(header)
     print("-" * len(header))
 
 
-def print_row(name: str, sklearn_t: float, rust_t: float):
+def print_row(name: str, sklearn_t: float, rust_t: float, verify_info: dict | None) -> bool:
+    """Print a result row; returns True if a correctness check FAILED."""
     speedup = sklearn_t / rust_t if rust_t > 0 else float("inf")
     marker = " ✓" if speedup >= 1.0 else " ✗"
+
+    failed = False
+    if verify_info is None:
+        corr = "— skipped"
+    else:
+        failed = not verify_info["passed"]
+        tag = "PASS" if verify_info["passed"] else "FAIL"
+        corr = f"{tag}  (max_abs={verify_info['max_abs']:.1e})"
+
     print(
         f"{name:<{COL_W}}"
         f"{_ms(sklearn_t):>{COL_W}}"
         f"{_ms(rust_t):>{COL_W}}"
-        f"{speedup:>{COL_W-2}.2f}x{marker}"
+        f"{speedup:>{COL_W-4}.2f}x{marker:>2}"
+        f"{corr:>{COL_W}}"
     )
+    return failed
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def run_suite(sizes: list[tuple[int, int]], n_reps: int):
+def run_suite(sizes: list[tuple[int, int]], n_reps: int, verify: bool) -> bool:
+    """Run every kernel across every size. Returns True if any check failed."""
+    any_fail = False
     for n_rows, n_cols in sizes:
         mb = n_rows * n_cols * 4 / 1e6
-        print(f"\n{'='*88}")
-        print(f"  Shape: ({n_rows:,} × {n_cols})   ~{mb:.0f} MB float32   reps={n_reps}")
-        print(f"{'='*88}")
+        print(f"\n{'='*110}")
+        print(f"  Shape: ({n_rows:,} × {n_cols})   ~{mb:.0f} MB float32   reps={n_reps}"
+              f"   verify={'on' if verify else 'off'}")
+        print(f"{'='*110}")
 
         data = make_data(n_rows, n_cols)
         print_header()
 
-        for name, (sk, ru) in bench_normalize(data, n_reps).items():
-            print_row(name, sk, ru)
-        for name, (sk, ru) in bench_normalize_inplace(data, n_reps).items():
-            print_row(name, sk, ru)
-        for name, (sk, ru) in bench_min_max(data, n_reps).items():
-            print_row(name, sk, ru)
-        for name, (sk, ru) in bench_standard_scaler(data, n_reps).items():
-            print_row(name, sk, ru)
+        for group in (bench_normalize, bench_normalize_inplace):
+            for name, (sk, ru, v) in group(data, n_reps, verify).items():
+                any_fail |= print_row(name, sk, ru, v)
 
         del data
         gc.collect()
+    return any_fail
 
 
 def main():
     parser = argparse.ArgumentParser(description="Bench Rust normalization vs sklearn")
     parser.add_argument("--large", action="store_true", help="Add very large sizes")
     parser.add_argument("--reps", type=int, default=5, help="Repetitions per kernel (default 5)")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Skip the rust-vs-sklearn correctness check")
     args = parser.parse_args()
 
     sizes = [
@@ -280,8 +245,17 @@ def main():
             (1_000_000, 500),
         ]
 
-    print(f"sklearn {__import__('sklearn').__version__}  |  numpy {np.__version__}  |  reps={args.reps}")
-    run_suite(sizes, args.reps)
+    verify = not args.no_verify
+    print(f"sklearn {__import__('sklearn').__version__}  |  numpy {np.__version__}  "
+          f"|  reps={args.reps}  |  verify={'on' if verify else 'off'}")
+    any_fail = run_suite(sizes, args.reps, verify)
+
+    if verify:
+        print()
+        if any_fail:
+            print("RESULT: one or more kernels FAILED the correctness check ✗")
+            sys.exit(1)
+        print("RESULT: all kernels passed the correctness check ✓")
 
 
 if __name__ == "__main__":
